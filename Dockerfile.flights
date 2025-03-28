@@ -1,0 +1,121 @@
+# Dockerfile.flights - Custom LibreChat API Image with Playwright for Google Flights MCP
+
+# Purpose:
+# This Dockerfile builds a custom image for the LibreChat `api` service.
+# It replaces the default Alpine-based image with a Debian Bookworm-based image
+# primarily to enable the installation and use of Playwright. Playwright is needed
+# by the custom `google-flights-mcp` server to use `fetch_mode="local"`, which
+# avoids issues encountered with other fetch modes (like Google consent screens or
+# missing tokens).
+
+# Base Image Choice:
+# Using `node:20-bookworm` (Debian) instead of the default `node:20-alpine` because
+# Playwright's browser binaries require the `glibc` C library, which is present in
+# Debian/Ubuntu but not in Alpine (which uses `musl`). This ensures Playwright
+# installs and runs correctly.
+
+# Structure:
+# 1. Install system dependencies (Python, Git, Playwright browser deps).
+# 2. Install Playwright itself using npx.
+# 3. Install Python dependencies for the MCP server.
+# 4. Copy the *local* version of the `google-flights-mcp` code (assuming it's
+#    in the parent directory relative to the build context) and modify its
+#    `fetch_mode` to "local".
+# 5. Replicate the Node.js application setup steps from the original LibreChat
+#    Dockerfile (copying code, installing npm dependencies, building frontend).
+# 6. Configure the final container environment and startup command.
+
+# Usage:
+# This Dockerfile is intended to be used via `docker-compose.override.yml`
+# by specifying it in the `build` section for the `api` service.
+
+# --- Start of Dockerfile ---
+
+# Use node:20-bookworm as the base image
+FROM node:20-bookworm
+
+# Switch to root for system-level installations
+USER root
+
+# Install system dependencies required for Python, Playwright, and Git
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    git \
+    curl \
+    # Clean up apt cache
+    && rm -rf /var/lib/apt/lists/*
+
+# Create symbolic link for python -> python3
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+# Install Playwright and its dependencies (using version from plan)
+# Using -y to auto-accept prompts, if any
+RUN npx -y playwright@1.51.1 install --with-deps chromium
+
+# Install Python MCP dependencies AND the Playwright Python library
+# Using --break-system-packages as recommended for container environments when installing as root
+RUN pip3 install --no-cache-dir --break-system-packages \
+    playwright \
+    fastmcp \
+    httpx \
+    python-dotenv \
+    pydantic \
+    fast-flights \
+    aiohttp
+
+# Create application directory and set ownership
+# The node user/group should exist in the node:20-bookworm image
+RUN mkdir -p /app && chown -R node:node /app
+
+# Copy the locally modified google-flights-mcp repository
+# Source path is relative to the new build context (..)
+COPY --chown=node:node google-flights-mcp /app/google-flights-mcp
+
+# Ensure correct permissions for the MCP directory (redundant if source permissions are okay, but safe)
+RUN chmod -R 755 /app/google-flights-mcp
+
+# Switch to the node user
+USER node
+
+# Set working directory (already /app, but good practice to reaffirm)
+WORKDIR /app
+
+# Copy application code as node user (from LibreChat subdirectory)
+# Copy package*.json first for better layer caching
+COPY --chown=node:node LibreChat/package*.json ./
+# Copy the rest of the application code (from LibreChat subdirectory)
+COPY --chown=node:node LibreChat/. .
+
+# Create directories for volumes *before* npm install to ensure correct permissions
+# These match the standard Dockerfile
+RUN mkdir -p /app/client/public/images /app/api/logs
+
+# Set npm config (from standard Dockerfile)
+RUN npm config set fetch-retry-maxtimeout 600000 && \
+    npm config set fetch-retries 5 && \
+    npm config set fetch-retry-mintimeout 15000
+
+# Install Node dependencies (from standard Dockerfile)
+RUN npm install --no-audit
+
+# Build the frontend (from standard Dockerfile)
+# Increased memory limit as per standard Dockerfile
+RUN NODE_OPTIONS="--max-old-space-size=2048" npm run frontend
+
+# Prune development dependencies (from standard Dockerfile)
+RUN npm prune --production
+
+# Clean npm cache (from standard Dockerfile)
+RUN npm cache clean --force
+
+# Expose the application port
+EXPOSE 3080
+
+# Set environment variable for host binding
+ENV HOST=0.0.0.0
+
+# Set the default command to run the backend
+# The docker-compose.override.yml uses `npm run backend:dev`, which will override this if used.
+CMD ["npm", "run", "backend"]
